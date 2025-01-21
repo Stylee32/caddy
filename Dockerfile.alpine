@@ -4,7 +4,10 @@ FROM caddy:${CADDY_VERSION}-builder-alpine AS builder
 
 # Build Caddy with the Cloudflare DNS module
 RUN xcaddy build \
-    --with github.com/caddy-dns/cloudflare github.com/hslatman/caddy-crowdsec-bouncer github.com/mholt/caddy-ratelimit github.com/porech/caddy-maxmind-geolocation
+    --with github.com/caddy-dns/cloudflare \
+	--with github.com/hslatman/caddy-crowdsec-bouncer \
+	--with github.com/mholt/caddy-ratelimit \
+	--with github.com/porech/caddy-maxmind-geolocation
 # Final stage
 FROM caddy:${CADDY_VERSION}-alpine
 
