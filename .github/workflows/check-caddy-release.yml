@@ -32,8 +32,8 @@ jobs:
         if: env.IS_NEW_RELEASE == 'true'
         run: |
           echo "{\"version\": \"${{ env.LATEST_VERSION }}\"}" > version.json
-          git config --global user.name "vkartk"
-          git config --global user.email "53650724+vkartk@users.noreply.github.com"
+          git config --global user.name "Stylee32"
+          git config --global user.email "Stylee32@googlemail.com"
           git add version.json
           git commit -m "Update version to ${{ env.LATEST_VERSION }}"
           git push
