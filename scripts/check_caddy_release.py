@@ -3,9 +3,18 @@ import json
 import requests
 import sys
 
+
 def get_latest_caddy_release():
+    headers = {}
+    token = os.getenv('GITHUB_TOKEN')
+    if token:
+        headers['Authorization'] = f'token {token}'
+
     try:
-        response = requests.get('https://api.github.com/repos/caddyserver/caddy/releases/latest')
+        response = requests.get(
+            'https://api.github.com/repos/caddyserver/caddy/releases/latest',
+            headers=headers
+        )
         response.raise_for_status()
         release = response.json()
         return release['tag_name']
@@ -13,10 +22,11 @@ def get_latest_caddy_release():
         print(f"Error fetching latest release: {e}", file=sys.stderr)
         sys.exit(1)
 
+
 def main():
     latest_version = get_latest_caddy_release()
     version_file = 'version.json'
-    
+
     if os.path.exists(version_file):
         with open(version_file, 'r') as f:
             data = json.load(f)
@@ -34,6 +44,7 @@ def main():
     else:
         with open(os.getenv('GITHUB_ENV'), 'a') as env_file:
             env_file.write(f'IS_NEW_RELEASE=false\n')
+
 
 if __name__ == "__main__":
     main()
