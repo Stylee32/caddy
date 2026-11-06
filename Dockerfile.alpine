@@ -1,16 +1,20 @@
-# Build stage
-ARG CADDY_VERSION
+# syntax=docker/dockerfile:1
+
+# Default for local builds only - CI always passes the version to build.
+ARG CADDY_VERSION=2.11.9
+
 FROM caddy:${CADDY_VERSION}-builder-alpine AS builder
 
-# Build Caddy with the Cloudflare DNS module
-RUN xcaddy build \
-    --with github.com/caddy-dns/cloudflare \
-	--with github.com/hslatman/caddy-crowdsec-bouncer/http \
-	--with github.com/hslatman/caddy-crowdsec-bouncer/appsec \
-	--with github.com/mholt/caddy-ratelimit \
-	--with github.com/porech/caddy-maxmind-geolocation
-# Final stage
+# Plugins are deliberately unpinned, so each build picks up their latest versions.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    xcaddy build \
+        --with github.com/caddy-dns/cloudflare \
+        --with github.com/hslatman/caddy-crowdsec-bouncer/http \
+        --with github.com/hslatman/caddy-crowdsec-bouncer/appsec \
+        --with github.com/mholt/caddy-ratelimit \
+        --with github.com/porech/caddy-maxmind-geolocation
+
 FROM caddy:${CADDY_VERSION}-alpine
 
-# Copy the custom-built Caddy binary
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy

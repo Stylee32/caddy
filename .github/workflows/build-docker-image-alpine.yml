@@ -1,137 +1,212 @@
 name: Build and Push Alpine Docker Image
 
 on:
-  repository_dispatch:
-    types: [caddy-release, build-alpine-image]
+  # Daily check for a new Caddy release. Does nothing if the image already exists.
+  schedule:
+    - cron: '0 6 * * *'
+  # Manual build, e.g. after a plugin update. Always rebuilds.
   workflow_dispatch:
     inputs:
       build_version:
-        description: 'Caddy version to build (without v prefix, e.g., 2.8.0)'
+        description: 'Caddy version to build (e.g. 2.11.9). Leave empty for the latest release.'
         required: false
-
-permissions:
-  contents: write
-  packages: write
+        type: string
+  # Build and test (no push) when the Dockerfile or this workflow changes.
+  pull_request:
+    paths:
+      - Dockerfile.alpine
+      - .github/workflows/build-docker-image-alpine.yml
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
 
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write   # GitHub release + version.json commit
+      packages: write   # push to GHCR
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Work out version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.build_version }}
+        run: |
+          set -euo pipefail
+          latest=$(gh api repos/caddyserver/caddy/releases/latest --jq .tag_name)
+          latest=${latest#v}
+          version=${INPUT_VERSION#v}
+          version=${version:-$latest}
+          if ! [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid Caddy version '$version'"
+            exit 1
+          fi
+          is_latest=false
+          [ "$version" = "$latest" ] && is_latest=true
+          {
+            echo "version=$version"
+            echo "minor=${version%.*}"
+            echo "major=${version%%.*}"
+            echo "is_latest=$is_latest"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/caddy"
+          } >> "$GITHUB_OUTPUT"
+          echo "Caddy $version (latest release: $latest)"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Convert Repository Owner to Lowercase
+      - name: Check whether to build
+        id: check
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          IMAGE: ${{ steps.version.outputs.image }}
+          EVENT: ${{ github.event_name }}
         run: |
-          echo "GITHUB_REPOSITORY_OWNER: ${GITHUB_REPOSITORY_OWNER}"
-          REPO_OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
-          echo "REPO_OWNER=${REPO_OWNER}" >> $GITHUB_ENV
-
-      - name: Set version if empty
-        id: set_version
-        run: |
-          if [ -n "${{ github.event.inputs.build_version }}" ]; then
-            VERSION=$(echo "${{ github.event.inputs.build_version }}" | sed 's/^v//')
-          elif [ -n "${{ github.event.client_payload.latest_version }}" ]; then
-            VERSION=$(echo "${{ github.event.client_payload.latest_version }}" | sed 's/^v//')
-          else
-            VERSION=$(cat version.json | jq -r '.version' | sed 's/^v//')
-          fi
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-
-      - name: Check Caddy version availability
-        id: check_version
-        run: |
-          RETRY_COUNT=0
-          MAX_RETRIES=5
-          SLEEP_INTERVAL=3600  # 1 hour in seconds
-
-          check_availability() {
-            AVAILABLE_BUILDER_ALPINE=$(curl -sL https://hub.docker.com/v2/repositories/library/caddy/tags/${{ env.VERSION }}-builder-alpine | jq -r '.name')
-            AVAILABLE_BASE_ALPINE=$(curl -sL https://hub.docker.com/v2/repositories/library/caddy/tags/${{ env.VERSION }}-alpine | jq -r '.name')
-            if [ "$AVAILABLE_BUILDER_ALPINE" = "${{ env.VERSION }}-builder-alpine" ] && [ "$AVAILABLE_BASE_ALPINE" = "${{ env.VERSION }}-alpine" ]; then
-              return 0
-            else
-              return 1
+          set -euo pipefail
+          # The official upstream images can lag behind the GitHub release.
+          for tag in "$VERSION-builder-alpine" "$VERSION-alpine"; do
+            if ! docker buildx imagetools inspect "caddy:$tag" > /dev/null 2>&1; then
+              if [ "$EVENT" = schedule ]; then
+                echo "::notice::caddy:$tag isn't on Docker Hub yet. A later run will pick it up."
+                echo "build=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::error::caddy:$tag doesn't exist on Docker Hub."
+              exit 1
             fi
-          }
-
-          until check_availability; do
-            
-            if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
-              echo "Caddy version ${{ env.VERSION }}-builder-alpine or ${{ env.VERSION }}-alpine is not available after $MAX_RETRIES retries. Triggering workflow again."
-              echo "DEPENDENCIES_AVAILABILITY=false" >> $GITHUB_ENV
-              break
-            fi
-            echo "Caddy version ${{ env.VERSION }}-builder-alpine or ${{ env.VERSION }}-alpine is not available. Retrying in $SLEEP_INTERVAL seconds..."
-            sleep $SLEEP_INTERVAL
-            RETRY_COUNT=$((RETRY_COUNT + 1))
           done
-          
-          if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-            echo "DEPENDENCIES_AVAILABILITY=true" >> $GITHUB_ENV
+          if [ "$EVENT" = schedule ] && docker buildx imagetools inspect "$IMAGE:$VERSION-alpine" > /dev/null 2>&1; then
+            echo "::notice::$IMAGE:$VERSION-alpine already exists. Nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "build=true" >> "$GITHUB_OUTPUT"
 
-      - name: Trigger Build Workflow
-        if: env.DEPENDENCIES_AVAILABILITY == 'false'
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            github.rest.repos.createDispatchEvent({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              event_type: 'build-alpine-image',
-            })
-
-      - name: Build and push Docker image (alpine)
-        if: env.DEPENDENCIES_AVAILABILITY == 'true'
-        uses: docker/build-push-action@v5
+      - name: Build image for testing
+        if: steps.check.outputs.build == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile.alpine
-          push: true
-          build-args: |
-            CADDY_VERSION=${{ env.VERSION }}
           platforms: linux/amd64
-          tags: |
-            ghcr.io/${{ env.REPO_OWNER }}/caddy:${{ env.VERSION }}-alpine
-            ghcr.io/${{ env.REPO_OWNER }}/caddy:alpine
+          build-args: CADDY_VERSION=${{ steps.version.outputs.version }}
+          pull: true
+          no-cache: true   # plugins are unpinned, so never reuse a cached xcaddy build
+          load: true
+          tags: caddy-test:local
 
-      - name: Clean up Docker images
-        if: env.DEPENDENCIES_AVAILABILITY == 'true'
+      - name: Smoke test
+        if: steps.check.outputs.build == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          docker rmi ghcr.io/${{ env.REPO_OWNER }}/caddy:${{ env.VERSION }}-alpine || true
-          docker rmi ghcr.io/${{ env.REPO_OWNER }}/caddy:alpine || true
-          docker builder prune --force
+          set -euo pipefail
+          reported=$(docker run --rm caddy-test:local caddy version)
+          echo "caddy version: $reported"
+          if [[ $reported != "v$VERSION"* ]]; then
+            echo "::error::Expected Caddy v$VERSION"
+            exit 1
+          fi
+
+          modules=$(docker run --rm caddy-test:local caddy list-modules)
+          missing=0
+          for m in \
+            dns.providers.cloudflare \
+            crowdsec \
+            http.handlers.crowdsec \
+            http.handlers.appsec \
+            http.handlers.rate_limit \
+            http.matchers.maxmind_geolocation
+          do
+            if grep -qxF "$m" <<< "$modules"; then
+              echo "found   $m"
+            else
+              echo "::error::Module $m is missing"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: Image tags and labels
+        id: meta
+        if: steps.check.outputs.build == 'true' && github.event_name != 'pull_request'
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.version.outputs.image }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}-alpine
+            type=raw,value=${{ steps.version.outputs.minor }}-alpine,enable=${{ steps.version.outputs.is_latest }}
+            type=raw,value=${{ steps.version.outputs.major }}-alpine,enable=${{ steps.version.outputs.is_latest }}
+            type=raw,value=alpine,enable=${{ steps.version.outputs.is_latest }}
+          labels: |
+            org.opencontainers.image.title=Caddy with Cloudflare DNS, CrowdSec, rate limiting and MaxMind GeoIP
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+
+      # Same inputs as the test build, so this reuses its layers rather than rebuilding.
+      - name: Build and push to GHCR
+        id: push
+        if: steps.check.outputs.build == 'true' && github.event_name != 'pull_request'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.alpine
+          platforms: linux/amd64
+          build-args: CADDY_VERSION=${{ steps.version.outputs.version }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
 
       - name: Create GitHub Release
-        if: env.DEPENDENCIES_AVAILABILITY == 'true'
-        uses: ncipollo/release-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        if: steps.check.outputs.build == 'true' && github.event_name != 'pull_request'
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
         with:
-          tag: ${{ env.VERSION }}-alpine
-          name: "Caddy Alpine v${{ env.VERSION }}"
-          commit: main
-          body: "New Caddy release detected. See the full release notes [here](https://github.com/caddyserver/caddy/releases/tag/v${{ env.VERSION }})."
-          draft: false
-          prerelease: false
+          tag: ${{ steps.version.outputs.version }}-alpine
+          name: "Caddy Alpine v${{ steps.version.outputs.version }}"
+          commit: ${{ github.sha }}
+          body: |
+            Caddy release notes: https://github.com/caddyserver/caddy/releases/tag/v${{ steps.version.outputs.version }}
+
+            Image: `${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}-alpine`
+            Digest: `${{ steps.push.outputs.digest }}`
           allowUpdates: true
+
+      # Records the last version built. The commit also counts as repo activity, which
+      # stops GitHub disabling the scheduled trigger after 60 days with no activity.
+      - name: Update version.json
+        if: >-
+          steps.check.outputs.build == 'true' && github.event_name != 'pull_request'
+          && steps.version.outputs.is_latest == 'true' && github.ref == 'refs/heads/main'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "{\"version\": \"v$VERSION\"}" > version.json
+          if git diff --quiet -- version.json; then
+            echo "version.json already up to date"
+            exit 0
+          fi
+          git config user.name "Stylee32"
+          git config user.email "Stylee32@googlemail.com"
+          git commit -m "Update version to v$VERSION" -- version.json
+          git pull --rebase --quiet
+          git push
